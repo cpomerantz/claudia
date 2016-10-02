@@ -1,8 +1,6 @@
 /*global module, require */
 var aws = require('aws-sdk'),
 	Promise = require('bluebird'),
-	templateFile = require('../util/template-file'),
-	validHttpCode = require('../util/valid-http-code'),
 	validAuthType = require('../util/valid-auth-type'),
 	validCredentials = require('../util/valid-credentials'),
 	allowApiInvocation = require('./allow-api-invocation'),
@@ -10,9 +8,10 @@ var aws = require('aws-sdk'),
 	promiseWrap = require('../util/promise-wrap'),
 	retriableWrap = require('../util/retriable-wrap'),
 	NullLogger = require('../util/null-logger'),
-	fs = Promise.promisifyAll(require('fs')),
-	getOwnerId = require('./get-owner-account-id');
-module.exports = function rebuildWebApi(functionName, functionVersion, restApiId, requestedConfig, awsRegion, optionalLogger) {
+	safeHash = require('../util/safe-hash'),
+	getOwnerId = require('./get-owner-account-id'),
+	registerAuthorizers = require('./register-authorizers');
+module.exports = function rebuildWebApi(functionName, functionVersion, restApiId, apiConfig, awsRegion, optionalLogger, configCacheStageVar) {
 	'use strict';
 	var logger = optionalLogger || new NullLogger(),
 		apiGateway = retriableWrap(
@@ -25,11 +24,11 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 						},
 						/Async$/
 						),
-		apiConfig,
+		configHash = safeHash(apiConfig),
 		existingResources,
 		ownerId,
 		knownIds = {},
-		inputTemplate,
+		authorizerIds,
 		findByPath = function (resourceItems, path) {
 			var result;
 			resourceItems.forEach(function (item) {
@@ -67,57 +66,28 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				resourceId: resourceId,
 				httpMethod: methodName,
 				credentials: credentials,
-				type: 'AWS',
+				type: 'AWS_PROXY',
 				integrationHttpMethod: 'POST',
-				requestTemplates: {
-					'application/json': inputTemplate,
-					'application/x-www-form-urlencoded': inputTemplate,
-					'text/xml': inputTemplate,
-					'application/xml': inputTemplate,
-					'text/plain': inputTemplate
-				},
 				uri: 'arn:aws:apigateway:' + awsRegion + ':lambda:path/2015-03-31/functions/arn:aws:lambda:' + awsRegion + ':' + ownerId + ':function:' + functionName + ':${stageVariables.lambdaVersion}/invocations'
 			});
 		},
 		corsHeaderValue = function () {
-			var val = apiConfig.corsHeaders || 'Content-Type,X-Amz-Date,Authorization,X-Api-Key';
+			var val = apiConfig.corsHeaders || 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token';
 			if (!supportsCors()) {
 				return '';
 			}
 			return '\'' + val + '\'';
 		},
 		createMethod = function (methodName, resourceId, methodOptions) {
-			var errorCode = function () {
-					if (!methodOptions.error) {
-						return '500';
-					}
-					if (validHttpCode(methodOptions.error)) {
-						return String(methodOptions.error);
-					}
-					if (methodOptions.error && methodOptions.error.code && validHttpCode(methodOptions.error.code)) {
-						return String(methodOptions.error.code);
-					}
-					return '500';
-				},
-				successCode = function () {
-					if (!methodOptions.success) {
-						return '200';
-					}
-					if (validHttpCode(methodOptions.success)) {
-						return String(methodOptions.success);
-					}
-					if (methodOptions.success && methodOptions.success.code && validHttpCode(methodOptions.success.code)) {
-						return String(methodOptions.success.code);
-					}
-					return '200';
-				},
-				apiKeyRequired = function () {
+			var apiKeyRequired = function () {
 					return methodOptions && methodOptions.apiKeyRequired;
 				},
 				authorizationType = function () {
 					if (methodOptions && methodOptions.authorizationType && validAuthType(methodOptions.authorizationType.toUpperCase())) {
 						return methodOptions.authorizationType.toUpperCase();
-					} else if (methodOptions && (methodOptions.invokeWithCredentials === true || validCredentials(methodOptions.invokeWithCredentials))) {
+					} else if (methodOptions.customAuthorizer) {
+						return 'CUSTOM';
+					} else if (methodOptions && validCredentials(methodOptions.invokeWithCredentials)) {
 						return 'AWS_IAM';
 					} else {
 						return 'NONE';
@@ -133,111 +103,30 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 					}
 					return null;
 				},
-				isRedirect = function (code) {
-					return /3[0-9][0-9]/.test(code);
-				},
-				errorContentType = function () {
-					return methodOptions && methodOptions.error && methodOptions.error.contentType;
-				},
-				headers = function (responseType) {
-					return methodOptions && methodOptions[responseType] && methodOptions[responseType].headers;
-				},
-				successContentType = function () {
-					return methodOptions && methodOptions.success && methodOptions.success.contentType;
-				},
-				successTemplate = function (headers) {
-					// success codes can also be used as error codes, so this has to work for both
-					var contentType = successContentType(), extractor = 'path';
-					if (contentType && contentType.indexOf(';') >= 0) {
-						contentType = contentType.split(';')[0];
-					}
-					if (!contentType || contentType === 'application/json') {
-						extractor = 'json';
-					}
-					if (headers && Array.isArray(headers)) {
-						return '#if($input.path(\'$.errorMessage\')!="")' +
-							'$input.' + extractor + '(\'$\')' +
-							'#{else}' +
-							'$input.' + extractor + '(\'$.response\')' +
-							'#{end}';
-					} else {
-						return '$input.' + extractor + '(\'$\')';
-					}
-				},
-				errorTemplate = function () {
-					var contentType = errorContentType();
-					if (!contentType || contentType === 'application/json') {
-						return '';
-					}
-					return '$input.path(\'$.errorMessage\')';
-				},
-				addCodeMapper = function (response) {
-					var methodResponseParams = { },
-						integrationResponseParams = { },
-						responseTemplates = {},
-						responseModels = {},
-						contentType = response.contentType || 'application/json',
-						headersInBody = function () {
-							return response.headers && Array.isArray(response.headers);
-						},
-						headerNames = response.headers && (Array.isArray(response.headers) ? response.headers : Object.keys(response.headers));
-					if (supportsCors()) {
-						methodResponseParams = {
-							'method.response.header.Access-Control-Allow-Origin': false,
-							'method.response.header.Access-Control-Allow-Headers': false
-						};
-						integrationResponseParams = {
-							'method.response.header.Access-Control-Allow-Origin': '\'*\'',
-							'method.response.header.Access-Control-Allow-Headers': corsHeaderValue()
-						};
-					}
-					if (isRedirect(response.code)) {
-						methodResponseParams['method.response.header.Location'] = false;
-						if (!headersInBody()) {
-							integrationResponseParams['method.response.header.Location'] = 'integration.response.body';
-						} else {
-							integrationResponseParams['method.response.header.Location'] = 'integration.response.body.response';
-						}
-						responseTemplates[contentType] = '##';
-					} else {
-						if (response.contentType) {
-							methodResponseParams['method.response.header.Content-Type'] = false;
-							integrationResponseParams['method.response.header.Content-Type'] = '\'' + response.contentType + '\'';
-						}
-						responseTemplates[contentType] = response.template || '';
-					}
-					if (response.headers) {
-						headerNames.forEach(function (headerName) {
-							methodResponseParams['method.response.header.' + headerName] = false;
-							if (headersInBody()) {
-								integrationResponseParams['method.response.header.' + headerName] = 'integration.response.body.headers.' + headerName;
-							} else {
-								integrationResponseParams['method.response.header.' + headerName] = '\'' + response.headers[headerName] + '\'';
-							}
-						});
-					}
-					responseModels[contentType] = 'Empty';
+				addMethodResponse = function () {
 					return apiGateway.putMethodResponseAsync({
 						restApiId: restApiId,
 						resourceId: resourceId,
 						httpMethod: methodName,
-						statusCode: response.code,
-						responseParameters: methodResponseParams,
-						responseModels: responseModels
+						statusCode: '200'
 					}).then(function () {
 						return apiGateway.putIntegrationResponseAsync({
 							restApiId: restApiId,
 							resourceId: resourceId,
 							httpMethod: methodName,
-							statusCode: response.code,
-							selectionPattern: response.pattern,
-							responseParameters: integrationResponseParams,
-							responseTemplates: responseTemplates
+							statusCode: '200',
+							responseTemplates: {
+								'application/json': ''
+							}
 						});
 					});
+				},
+				authorizerId = function () {
+					return methodOptions && methodOptions.customAuthorizer && authorizerIds[methodOptions.customAuthorizer];
 				};
 			return apiGateway.putMethodAsync({
 				authorizationType: authorizationType(),
+				authorizerId: authorizerId(),
 				httpMethod: methodName,
 				resourceId: resourceId,
 				restApiId: restApiId,
@@ -245,15 +134,10 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			}).then(function () {
 				return putLambdaIntegration(resourceId, methodName, credentials());
 			}).then(function () {
-				var results = [{code: successCode(), pattern: '', contentType: successContentType(), template: successTemplate(headers('success')), headers: headers('success')}];
-				if (errorCode() !== successCode()) {
-					results[0].pattern = '^$';
-					results.push({code: errorCode(), pattern: '', contentType: errorContentType(), template: errorTemplate(), headers: headers('error')});
-				}
-				return Promise.map(results, addCodeMapper, {concurrency: 1});
+				return addMethodResponse();
 			});
 		},
-		createCorsHandler = function (resourceId, allowedMethods) {
+		createCorsHandler = function (resourceId) {
 			return apiGateway.putMethodAsync({
 				authorizationType: 'NONE',
 				httpMethod: 'OPTIONS',
@@ -266,6 +150,14 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 					return putMockIntegration(resourceId, 'OPTIONS');
 				}
 			}).then(function () {
+				var responseParams = null;
+				if (!apiConfig.corsHandlers) {
+					responseParams = {
+						'method.response.header.Access-Control-Allow-Headers': false,
+						'method.response.header.Access-Control-Allow-Methods': false,
+						'method.response.header.Access-Control-Allow-Origin': false
+					};
+				}
 				return apiGateway.putMethodResponseAsync({
 					restApiId: restApiId,
 					resourceId: resourceId,
@@ -274,20 +166,17 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 					responseModels: {
 						'application/json': 'Empty'
 					},
-					responseParameters: {
-						'method.response.header.Access-Control-Allow-Headers': false,
-						'method.response.header.Access-Control-Allow-Methods': false,
-						'method.response.header.Access-Control-Allow-Origin': false
-					}
+					responseParameters: responseParams
 				});
 			}).then(function () {
-				var responseParams = {
+				var responseParams = null;
+
+				if (!apiConfig.corsHandlers) {
+					responseParams = {
 						'method.response.header.Access-Control-Allow-Headers': corsHeaderValue(),
-						'method.response.header.Access-Control-Allow-Methods': '\'' + allowedMethods.join(',') + ',OPTIONS\'',
+						'method.response.header.Access-Control-Allow-Methods': '\'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT\'',
 						'method.response.header.Access-Control-Allow-Origin': '\'*\''
 					};
-				if (apiConfig.corsHandlers) {
-					responseParams['method.response.header.Access-Control-Allow-Origin'] = 'integration.response.body';
 				}
 				return apiGateway.putIntegrationResponseAsync({
 					restApiId: restApiId,
@@ -331,7 +220,7 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				return Promise.map(supportedMethods, createMethodMapper, {concurrency: 1});
 			}).then(function () {
 				if (supportsCors()) {
-					return createCorsHandler(resourceId, supportedMethods);
+					return createCorsHandler(resourceId);
 				}
 			});
 		},
@@ -372,12 +261,6 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				});
 			}
 		},
-		readTemplates = function () {
-			return fs.readFileAsync(templateFile('apigw-params.txt'), 'utf8')
-			.then(function (fileContents) {
-				inputTemplate = fileContents;
-			});
-		},
 		pathSort = function (resA, resB) {
 			if (resA.path > resB.path) {
 				return 1;
@@ -386,47 +269,74 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			}
 			return -1;
 		},
-		rebuildApi = function () {
-			return allowApiInvocation(functionName, functionVersion, restApiId, ownerId, awsRegion)
-			.then(getExistingResources)
+		removeExistingResources = function () {
+			return getExistingResources()
 			.then(function (resources) {
 				existingResources = resources.items;
 				existingResources.sort(pathSort);
 				return existingResources;
 			}).then(findRoot)
-			.then(dropSubresources)
+			.then(dropSubresources);
+		},
+		rebuildApi = function () {
+			return allowApiInvocation(functionName, functionVersion, restApiId, ownerId, awsRegion)
 			.then(function () {
 				return Promise.map(Object.keys(apiConfig.routes), configurePath, {concurrency: 1});
 			});
 		},
 		deployApi = function () {
+			var stageVars = {
+				lambdaVersion: functionVersion
+			};
+			if (configCacheStageVar) {
+				stageVars[configCacheStageVar] = configHash;
+			}
+
 			return apiGateway.createDeploymentAsync({
 				restApiId: restApiId,
 				stageName: functionVersion,
-				variables: {
-					lambdaVersion: functionVersion
-				}
+				variables: stageVars
 			});
 		},
-		upgradeConfig = function (config) {
-			var result;
-			if (config.version >= 2) {
-				return config;
-			}
-			result = { version: 3, routes: {} };
-			Object.keys(config).forEach(function (route) {
-				result.routes[route] = {};
-				config[route].methods.forEach(function (methodName) {
-					result.routes[route][methodName] = {};
+		configureAuthorizers = function () {
+			if (apiConfig.authorizers && apiConfig.authorizers !== {}) {
+				return registerAuthorizers(apiConfig.authorizers, restApiId, awsRegion, functionVersion, logger).then(function (result) {
+					authorizerIds = result;
 				});
+			} else {
+				authorizerIds = {};
+			}
+		},
+		uploadApiConfig = function () {
+			return removeExistingResources()
+				.then(configureAuthorizers)
+				.then(rebuildApi)
+				.then(deployApi);
+		},
+		getExistingConfigHash = function () {
+			if (!configCacheStageVar) {
+				return false;
+			}
+			return apiGateway.getStageAsync({
+				restApiId: restApiId,
+				stageName: functionVersion
+			}).then(function (stage) {
+				return stage.variables && stage.variables[configCacheStageVar];
+			}).catch(function () {
+				return false;
 			});
-			return result;
+
 		};
-	apiConfig = upgradeConfig(requestedConfig);
 	return getOwnerId(logger).then(function (accountOwnerId) {
 			ownerId = accountOwnerId;
 		})
-		.then(readTemplates)
-		.then(rebuildApi)
-		.then(deployApi);
+		.then(getExistingConfigHash)
+		.then(function (existingHash) {
+			if (existingHash && existingHash === configHash) {
+				logger.logStage('Reusing cached API configuration');
+			} else {
+				return uploadApiConfig();
+			}
+		});
+
 };
