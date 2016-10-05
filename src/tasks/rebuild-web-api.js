@@ -38,6 +38,9 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			});
 			return result;
 		},
+        getExistingModels = function () {
+            return apiGateway.getModelsAsync({restApiId: restApiId, limit: 499});
+        },
 		getExistingResources = function () {
 			return apiGateway.getResourcesAsync({restApiId: restApiId, limit: 499});
 		},
@@ -130,7 +133,9 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 				httpMethod: methodName,
 				resourceId: resourceId,
 				restApiId: restApiId,
-				apiKeyRequired: apiKeyRequired()
+				apiKeyRequired: apiKeyRequired(),
+				requestParameters: methodOptions.requestParameters,
+                requestModels: methodOptions.requestModels
 			}).then(function () {
 				return putLambdaIntegration(resourceId, methodName, credentials());
 			}).then(function () {
@@ -269,17 +274,47 @@ module.exports = function rebuildWebApi(functionName, functionVersion, restApiId
 			}
 			return -1;
 		},
+        dropModels = function (models) {
+            var dropModelMapper = function (model) {
+                if (model.name === 'Empty' || model.name === 'Error') {
+                    return Promise.resolve();
+                }
+                return apiGateway.deleteModelAsync({
+                    modelName: model.name,
+                    restApiId: restApiId
+                });
+            };
+            if (models && models.items) {
+                return Promise.map(models.items, dropModelMapper, {concurrency: 1});
+            } else {
+                return Promise.resolve();
+            }
+        },
 		removeExistingResources = function () {
 			return getExistingResources()
-			.then(function (resources) {
-				existingResources = resources.items;
-				existingResources.sort(pathSort);
-				return existingResources;
-			}).then(findRoot)
-			.then(dropSubresources);
+                .then(function (resources) {
+                    existingResources = resources.items;
+                    existingResources.sort(pathSort);
+                    return existingResources;
+                })
+                .then(findRoot)
+                .then(dropSubresources)
+                .then(getExistingModels)
+                .then(dropModels);
 		},
+        createModel = function(model) {
+            return apiGateway.createModelAsync({
+                restApiId: restApiId,
+                name: model.name,
+                contentType: 'application/json',
+                schema: JSON.stringify(model.schema)
+            });
+        },
 		rebuildApi = function () {
 			return allowApiInvocation(functionName, functionVersion, restApiId, ownerId, awsRegion)
+            .then(function () {
+                return Promise.map(apiConfig.models, createModel, {concurrency: 1});
+            })
 			.then(function () {
 				return Promise.map(Object.keys(apiConfig.routes), configurePath, {concurrency: 1});
 			});
